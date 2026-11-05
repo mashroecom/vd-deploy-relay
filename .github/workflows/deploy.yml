@@ -1,0 +1,88 @@
+name: Deploy video-downloader-api
+
+# This public repo holds only this workflow. The app code stays private and is
+# fetched with a read-only deploy key. Server output is encrypted before logging.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: deploy or diagnose
+        type: choice
+        options: [deploy, diagnose, proxy]
+        default: deploy
+      ref:
+        description: Branch or commit of the private repo
+        default: main
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  APP_DIR: /opt/video-downloader-api
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Fetch private app code
+        if: inputs.mode == 'deploy'
+        uses: actions/checkout@v4
+        with:
+          repository: mashroecom/video-downloader-api
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.REPO_DEPLOY_KEY }}
+          path: app
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          echo "SSH=ssh -o BatchMode=yes root@${{ secrets.DEPLOY_HOST }}" >> "$GITHUB_ENV"
+
+      - name: Upload code and env
+        if: inputs.mode == 'deploy'
+        run: |
+          $SSH "mkdir -p $APP_DIR"
+          tar -C app --exclude=.git -czf - . | $SSH "tar -xzf - -C $APP_DIR"
+          printf '%s' "${{ secrets.ENV_FILE }}" | $SSH "[ -f $APP_DIR/.env ] && cat >/dev/null || (umask 077 && cat > $APP_DIR/.env)"
+
+      - name: Build and start
+        if: inputs.mode == 'deploy'
+        run: |
+          $SSH "cd $APP_DIR && docker compose up -d --build --remove-orphans > /tmp/vd-deploy.log 2>&1; echo exit=\$?; tail -c 3000 /tmp/vd-deploy.log" \
+            | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:DIAG_PASS | base64 -w0; echo
+        env:
+          DIAG_PASS: ${{ secrets.DIAG_PASS }}
+
+      - name: Health check
+        if: inputs.mode == 'deploy'
+        run: |
+          for i in $(seq 1 40); do
+            if $SSH "curl -fsS http://127.0.0.1:8090/up >/dev/null"; then echo "HEALTH_OK"; exit 0; fi
+            sleep 6
+          done
+          echo "HEALTH_FAILED"
+          $SSH "cd $APP_DIR && docker compose ps; docker compose logs --tail=80 app worker" 2>&1 \
+            | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:DIAG_PASS | base64 -w0; echo
+          exit 1
+        env:
+          DIAG_PASS: ${{ secrets.DIAG_PASS }}
+
+      - name: Server overview (encrypted)
+        if: inputs.mode != 'deploy'
+        run: |
+          $SSH 'bash -s' <<'SH' 2>&1 | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:DIAG_PASS | base64 -w0; echo
+          echo "== containers"; docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'
+          echo "== networks"; docker network ls --format '{{.Name}}|{{.Driver}}'
+          echo "== listeners"; ss -tlnp | awk 'NR>1 {print $4, $6}'
+          echo "== proxy labels"; for c in $(docker ps -q); do n=$(docker inspect -f '{{.Name}}' $c); docker inspect -f '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}};{{end}}' $c | tr ';' '\n' | grep -E "traefik.http.routers.*rule|VIRTUAL_HOST|caddy" | sed "s#^#$n #"; done
+          echo "== nginx host"; systemctl is-active nginx 2>/dev/null; ls /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null
+          echo "== disk"; df -h / | tail -1; free -h | head -2
+          echo "== app"; ls /opt/video-downloader-api 2>/dev/null | head; cd /opt/video-downloader-api 2>/dev/null && docker compose ps 2>/dev/null
+          SH
+        env:
+          DIAG_PASS: ${{ secrets.DIAG_PASS }}
