@@ -62,7 +62,7 @@ jobs:
         if: inputs.mode == 'deploy'
         run: |
           for i in $(seq 1 40); do
-            if $SSH "curl -fsS http://127.0.0.1:8090/up >/dev/null"; then echo "HEALTH_OK"; exit 0; fi
+            if $SSH "curl -fsS http://127.0.0.1:8197/up >/dev/null"; then echo "HEALTH_OK"; exit 0; fi
             sleep 6
           done
           echo "HEALTH_FAILED"
